@@ -145,9 +145,11 @@ class AsyncuaSensor(CoordinatorEntity[AsyncuaCoordinator], SensorEntity):
 
     def _parse_coordinator_data(
         self,
-        coordinator_data: dict[str, Any],
+        coordinator_data: dict[str, Any] | None,
     ) -> Any:
         """Parse the value from the mapped coordinator."""
+        if coordinator_data is None:
+            return None
         if self._attr_name is None:
             raise ConfigEntryError(
                 f"Unable to find {self._attr_name} in coordinator {self.coordinator.name}"
