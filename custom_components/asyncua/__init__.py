@@ -50,6 +50,8 @@ from .const import (
 _LOGGER = logging.getLogger("asyncua")
 _LOGGER.setLevel(logging.WARNING)
 
+_KEEPALIVE_INTERVAL = 30  # seconds between keep-alive pings (must be < session_timeout)
+
 BASE_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HUB_ID): cv.string,
@@ -348,6 +350,20 @@ class OpcuaHub:
             self.connected = False
             return False
 
+    async def ping(self) -> bool:
+        """Read server time to keep the OPC UA session and TCP connection alive."""
+        try:
+            await self.client.get_node("i=2258").read_value()
+            return True
+        except Exception as e:
+            _LOGGER.warning(
+                "Keep-alive ping failed for hub %s: %s",
+                self._hub_name,
+                e,
+            )
+            self.connected = False
+            return False
+
     async def start_subscription(
         self,
         node_key_pair: dict[str, str],
@@ -423,6 +439,7 @@ class AsyncuaCoordinator(DataUpdateCoordinator):
         self._subscribe = subscribe
         self._subscribe_period_ms = subscribe_period_ms
         self._subscribed_cache: dict[str, Any] = {}
+        self._keepalive_task: asyncio.Task | None = None
         super().__init__(
             hass=hass,
             logger=_LOGGER,
@@ -462,22 +479,54 @@ class AsyncuaCoordinator(DataUpdateCoordinator):
         self._subscribed_cache[name] = val
         self.async_set_updated_data(dict(self._subscribed_cache))
 
+    async def _keepalive_loop(self) -> None:
+        """Ping the server every _KEEPALIVE_INTERVAL seconds; reconnect if dead."""
+        while True:
+            await asyncio.sleep(_KEEPALIVE_INTERVAL)
+            try:
+                if await self._hub.ping():
+                    continue
+                _LOGGER.warning(
+                    "Keep-alive failed for hub %s, attempting to reconnect...",
+                    self.name,
+                )
+                await self._hub.stop_subscription()
+                await self._hub.start_subscription(
+                    node_key_pair=self._node_key_pair,
+                    callback=self._subscription_callback,
+                    period_ms=self._subscribe_period_ms,
+                )
+            except Exception as e:
+                _LOGGER.error(
+                    "Unexpected error in keep-alive loop for hub %s: %s",
+                    self.name,
+                    e,
+                )
+
     async def start_subscription(self) -> None:
-        """Start OPC UA subscription for all registered nodes."""
+        """Start OPC UA subscription and keepalive task for all registered nodes."""
         if not self._node_key_pair:
             _LOGGER.warning(
                 "Coordinator %s has no nodes registered; subscription not started.",
                 self.name,
             )
             return
-        await self._hub.start_subscription(
+        success = await self._hub.start_subscription(
             node_key_pair=self._node_key_pair,
             callback=self._subscription_callback,
             period_ms=self._subscribe_period_ms,
         )
+        if success:
+            self._keepalive_task = self.hass.async_create_background_task(
+                self._keepalive_loop(),
+                name=f"asyncua_keepalive_{self.name}",
+            )
 
     async def stop_subscription(self) -> None:
-        """Stop OPC UA subscription."""
+        """Stop the keepalive task and OPC UA subscription."""
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
         await self._hub.stop_subscription()
 
     async def _async_update_data(self) -> dict[str, Any]:
