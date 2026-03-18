@@ -10,7 +10,7 @@ I found an older project which uses the python-opcua, which is deprecated and de
 
 ## Table of contents
 
-**[`Installation`](#installation)** **[`Asyncua-Coordinator`](#asyncua-coordinator)** **[`Sensor`](#sensors-entities)** **[`Binary-Sensor`](#binary-sensors-entities)** **[`Switch`](#switch-entities)** **[`Directory`](#-directory-structure)** **[`Donate`](#donate)**
+**[`Installation`](#installation)** **[`Asyncua-Coordinator`](#asyncua-coordinator)** **[`Subscription Mode`](#subscription-mode)** **[`Sensor`](#sensors-entities)** **[`Binary-Sensor`](#binary-sensors-entities)** **[`Switch`](#switch-entities)** **[`Directory`](#-directory-structure)** **[`Donate`](#donate)**
 
 <br>
 
@@ -65,11 +65,45 @@ Paste the following lines to your `configuration.yaml` file. Remove or add more 
 | - | - | - | - |
 | `name` | string | **Required** | **Unique** identifier for each OPCUA Server |
 | `url` | string | **Required** | OPCUA server URL within the same network |
-| `scan_interval` | int | Optional | Polling interval to refresh data |
+| `scan_interval` | int | Optional | Polling interval in seconds to refresh data. Ignored when `subscribe: true`. Default: 30s |
+| `subscribe` | bool | Optional | Enable OPC UA subscription mode for push-based updates instead of polling. Default: `false` |
+| `subscribe_period` | int | Optional | Publishing interval in milliseconds for the OPC UA subscription. Only used when `subscribe: true`. Default: `500` |
 | `username` | string | **Optional** | Username to connect to the server |
 | `password` | string | **Optional** | Password to connect to the server |
 
 </details>
+
+---
+
+## Subscription Mode
+
+By default this integration **polls** the OPC UA server on a fixed `scan_interval`. When you need data to update instantly - as soon as the value changes on the server - you can enable **subscription mode** instead.
+
+In subscription mode the integration keeps a single persistent connection to the server and registers an OPC UA subscription. The server then **pushes** change notifications to HA automatically, so entities update in near real-time without any polling overhead.
+
+### Configuration
+
+Replace `scan_interval` with `subscribe: true` on the hub:
+
+```yaml
+asyncua:
+  - name: "plc-01"
+    url: "opc.tcp://localhost:4840/"
+    subscribe: true
+    subscribe_period: 100 # Optional. Publishing interval in ms. Default is 500ms.
+```
+
+> **Note:** `scan_interval` is ignored when `subscribe: true`.
+
+### What is `subscribe_period`?
+
+`subscribe_period` sets the OPC UA **publishing interval** (in milliseconds). This controls how frequently the server batches and sends change notifications to HA. A lower value means lower latency; a higher value reduces network messages when many nodes change at once.
+
+| Value | Effect |
+| - | - |
+| `100` | Up to ~100ms latency, suitable for fast-changing values |
+| `500` *(default)* | Good balance for most home automation use cases |
+| `1000+` | Reduced traffic when many nodes change frequently |
 
 ---
 

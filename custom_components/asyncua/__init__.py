@@ -15,6 +15,7 @@ from asyncua.common import ua_utils
 from asyncua.ua.uatypes import DataValue
 import voluptuous as vol
 
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
@@ -36,6 +37,8 @@ from .const import (
     CONF_HUB_MODEL,
     CONF_HUB_PASSWORD,
     CONF_HUB_SCAN_INTERVAL,
+    CONF_HUB_SUBSCRIBE,
+    CONF_HUB_SUBSCRIBE_PERIOD,
     CONF_HUB_URL,
     CONF_HUB_USERNAME,
     CONF_NODE_ID,
@@ -54,6 +57,8 @@ BASE_SCHEMA = vol.Schema(
         vol.Optional(CONF_HUB_MANUFACTURER, default=""): cv.string,
         vol.Optional(CONF_HUB_MODEL, default=""): cv.string,
         vol.Optional(CONF_HUB_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
+        vol.Optional(CONF_HUB_SUBSCRIBE, default=False): cv.boolean,
+        vol.Optional(CONF_HUB_SUBSCRIBE_PERIOD, default=500): int,
         vol.Inclusive(CONF_HUB_USERNAME, None): cv.string,
         vol.Inclusive(CONF_HUB_PASSWORD, None): cv.string,
     }
@@ -95,11 +100,18 @@ async def async_setup(
     hass.data[DOMAIN] = {}
 
     async def _set_value(service):
-        hub = hass.data[DOMAIN][service.data.get(ATTR_NODE_HUB)].hub
-        await hub.set_value(
-            nodeid=service.data[ATTR_NODE_ID],
-            value=service.data[ATTR_VALUE],
-        )
+        coordinator: AsyncuaCoordinator = hass.data[DOMAIN][service.data.get(ATTR_NODE_HUB)]
+        hub = coordinator.hub
+        if coordinator.subscribe and hub.connected:
+            await hub.set_value_direct(
+                nodeid=service.data[ATTR_NODE_ID],
+                value=service.data[ATTR_VALUE],
+            )
+        else:
+            await hub.set_value(
+                nodeid=service.data[ATTR_NODE_ID],
+                value=service.data[ATTR_VALUE],
+            )
         return True
 
     async def _configure_hub(hub: dict) -> None:
@@ -108,7 +120,8 @@ async def async_setup(
                 f"Duplicated hub detected {hub[CONF_HUB_ID]}. "
                 f"OPCUA hub name must be unique."
             )
-        hass.data[DOMAIN][hub[CONF_HUB_ID]] = AsyncuaCoordinator(
+        subscribe = hub.get(CONF_HUB_SUBSCRIBE, False)
+        coordinator = AsyncuaCoordinator(
             hass=hass,
             name=hub[CONF_HUB_ID],
             hub=OpcuaHub(
@@ -119,6 +132,8 @@ async def async_setup(
                 username=hub.get(CONF_HUB_USERNAME),
                 password=hub.get(CONF_HUB_PASSWORD),
             ),
+            subscribe=subscribe,
+            subscribe_period_ms=hub.get(CONF_HUB_SUBSCRIBE_PERIOD, 500),
             update_interval_in_second=timedelta(
                 seconds=hub.get(
                     CONF_HUB_SCAN_INTERVAL,
@@ -126,7 +141,16 @@ async def async_setup(
                 ),
             ),
         )
-        await hass.data[DOMAIN][hub[CONF_HUB_ID]].async_request_refresh()
+        hass.data[DOMAIN][hub[CONF_HUB_ID]] = coordinator
+
+        if subscribe:
+            async def _start_subscription(_event=None) -> None:
+                await coordinator.start_subscription()
+
+            hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _start_subscription)
+        else:
+            await coordinator.async_request_refresh()
+
         hass.services.async_register(
             domain=DOMAIN,
             service=f"{SERVICE_SET_VALUE}",
@@ -138,6 +162,30 @@ async def async_setup(
     await asyncio.gather(*configure_hub_tasks)
 
     return True
+
+
+class OpcuaSubHandler:
+    """OPC UA subscription handler that dispatches data-change notifications."""
+
+    def __init__(self, callback: Callable[[str, Any], None]) -> None:
+        self._callback = callback
+        self._name_map: dict = {}  # NodeId -> entity name
+
+    def set_node_map(self, name_map: dict) -> None:
+        """Map NodeId objects to entity names."""
+        self._name_map = name_map
+
+    def datachange_notification(self, node, val, data) -> None:
+        """Called by asyncua when a subscribed node value changes."""
+        name = self._name_map.get(node.nodeid)
+        if name is not None:
+            self._callback(name, val)
+
+    def event_notification(self, event) -> None:
+        pass
+
+    def status_change_notification(self, status) -> None:
+        pass
 
 
 class OpcuaHub:
@@ -181,6 +229,8 @@ class OpcuaHub:
         self.packet_count: int = 0
         self.elapsed_time: float = 0
         self.cache_val: dict[str, Any] = {}
+        self._sub_handler: OpcuaSubHandler | None = None
+        self._subscription: Any = None
 
     @property
     def hub_name(self) -> str:
@@ -278,6 +328,84 @@ class OpcuaHub:
         await node.write_value(DataValue(var))
         return True
 
+    async def set_value_direct(self, nodeid: str, value: Any) -> bool:
+        """Set value using the existing persistent connection (subscribe mode)."""
+        try:
+            node = self.client.get_node(nodeid=nodeid)
+            node_type = await node.read_data_type_as_variant_type()
+            var = ua.Variant(
+                ua_utils.string_to_variant(
+                    string=str(value),
+                    vtype=node_type,
+                )
+            )
+            await node.write_value(DataValue(var))
+            return True
+        except Exception as e:
+            _LOGGER.error(
+                "Error writing value to node %s on hub %s: %s",
+                nodeid,
+                self._hub_name,
+                e,
+            )
+            self.connected = False
+            return False
+
+    async def start_subscription(
+        self,
+        node_key_pair: dict[str, str],
+        callback: Callable[[str, Any], None],
+        period_ms: int = 500,
+    ) -> bool:
+        """Connect persistently and subscribe to data changes for all nodes."""
+        try:
+            await self.client.connect()
+            self.connected = True
+
+            name_map: dict = {}
+            nodes = []
+            for name, nodeid_str in node_key_pair.items():
+                node = self.client.get_node(nodeid=nodeid_str)
+                name_map[node.nodeid] = name
+                nodes.append(node)
+
+            self._sub_handler = OpcuaSubHandler(callback=callback)
+            self._sub_handler.set_node_map(name_map)
+            self._subscription = await self.client.create_subscription(
+                period_ms, self._sub_handler
+            )
+            await self._subscription.subscribe_data_change(nodes)
+            _LOGGER.info(
+                "OPC UA subscription started for hub %s (%d nodes, period %dms)",
+                self._hub_name,
+                len(nodes),
+                period_ms,
+            )
+            return True
+        except Exception as e:
+            _LOGGER.error(
+                "Failed to start OPC UA subscription for hub %s: %s",
+                self._hub_name,
+                e,
+            )
+            self.connected = False
+            return False
+
+    async def stop_subscription(self) -> None:
+        """Delete the subscription and disconnect."""
+        try:
+            if self._subscription is not None:
+                await self._subscription.delete()
+                self._subscription = None
+            await self.client.disconnect()
+            self.connected = False
+        except Exception as e:
+            _LOGGER.warning(
+                "Error stopping subscription for hub %s: %s",
+                self._hub_name,
+                e,
+            )
+
 
 class AsyncuaCoordinator(DataUpdateCoordinator):
     """Coordinator to manage fetching data using OpcuaHub from OPCUA server."""
@@ -287,17 +415,22 @@ class AsyncuaCoordinator(DataUpdateCoordinator):
         hass: HomeAssistant,
         name: str,
         hub: OpcuaHub,
+        subscribe: bool = False,
+        subscribe_period_ms: int = 500,
         update_interval_in_second: timedelta = DEFAULT_SCAN_INTERVAL,
     ) -> None:
         """Initialize the coordinator."""
         self._hub = hub
         self._sensors: list = []
         self._node_key_pair: dict[str, str] = {}
+        self._subscribe = subscribe
+        self._subscribe_period_ms = subscribe_period_ms
+        self._subscribed_cache: dict[str, Any] = {}
         super().__init__(
             hass=hass,
             logger=_LOGGER,
             name=name,
-            update_interval=update_interval_in_second,
+            update_interval=None if subscribe else update_interval_in_second,
         )
 
     @property
@@ -322,8 +455,38 @@ class AsyncuaCoordinator(DataUpdateCoordinator):
             self._node_key_pair[val_sensor[CONF_NODE_NAME]] = val_sensor[CONF_NODE_ID]
         return True
 
+    @property
+    def subscribe(self) -> bool:
+        """Return whether this coordinator uses OPC UA subscriptions."""
+        return self._subscribe
+
+    def _subscription_callback(self, name: str, val: Any) -> None:
+        """Called from OpcuaSubHandler when a node value changes."""
+        self._subscribed_cache[name] = val
+        self.async_set_updated_data(dict(self._subscribed_cache))
+
+    async def start_subscription(self) -> None:
+        """Start OPC UA subscription for all registered nodes."""
+        if not self._node_key_pair:
+            _LOGGER.warning(
+                "Coordinator %s has no nodes registered; subscription not started.",
+                self.name,
+            )
+            return
+        await self._hub.start_subscription(
+            node_key_pair=self._node_key_pair,
+            callback=self._subscription_callback,
+            period_ms=self._subscribe_period_ms,
+        )
+
+    async def stop_subscription(self) -> None:
+        """Stop OPC UA subscription."""
+        await self._hub.stop_subscription()
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Update the state of the sensor."""
+        if self._subscribe:
+            return self._subscribed_cache
         vals = await self.hub.get_values(node_key_pair=self.node_key_pair)
         if not self.hub.connected:
             return {}
