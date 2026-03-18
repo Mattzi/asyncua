@@ -56,7 +56,7 @@ BASE_SCHEMA = vol.Schema(
         vol.Required(CONF_HUB_URL): cv.string,
         vol.Optional(CONF_HUB_MANUFACTURER, default=""): cv.string,
         vol.Optional(CONF_HUB_MODEL, default=""): cv.string,
-        vol.Optional(CONF_HUB_SCAN_INTERVAL, default=DEFAULT_SCAN_INTERVAL): int,
+        vol.Optional(CONF_HUB_SCAN_INTERVAL, default=int(DEFAULT_SCAN_INTERVAL.total_seconds())): vol.Any(None, cv.positive_int),
         vol.Optional(CONF_HUB_SUBSCRIBE, default=False): cv.boolean,
         vol.Optional(CONF_HUB_SUBSCRIBE_PERIOD, default=500): int,
         vol.Inclusive(CONF_HUB_USERNAME, None): cv.string,
@@ -135,10 +135,7 @@ async def async_setup(
             subscribe=subscribe,
             subscribe_period_ms=hub.get(CONF_HUB_SUBSCRIBE_PERIOD, 500),
             update_interval_in_second=timedelta(
-                seconds=hub.get(
-                    CONF_HUB_SCAN_INTERVAL,
-                    DEFAULT_SCAN_INTERVAL,
-                ),
+                seconds=hub.get(CONF_HUB_SCAN_INTERVAL) or DEFAULT_SCAN_INTERVAL.total_seconds(),
             ),
         )
         hass.data[DOMAIN][hub[CONF_HUB_ID]] = coordinator
